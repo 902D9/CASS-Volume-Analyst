@@ -3,11 +3,11 @@ import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { FolderParser } from './services/FolderParser';
 import { Gridifier } from './services/Gridifier';
 import { VolumeCalculator } from './services/VolumeCalculator';
-import { MeshData, VolumeResult, GridData } from './types';
+import { BoundaryParser } from './services/BoundaryParser';
+import { MeshData, VolumeResult, GridData, BoundaryPoint, Point3D } from './types';
 import { AnalysisDashboard } from './components/AnalysisDashboard';
 import { Visualizer } from './components/Visualizer';
 
-// IndexedDB 用于存储已处理的格网数据
 const DB_NAME = 'CASS_PRO_CACHE_DB';
 const STORE_NAME = 'cached_grids';
 
@@ -39,6 +39,7 @@ function openDB(): Promise<IDBDatabase> {
 const App: React.FC = () => {
   const [mesh1, setMesh1] = useState<MeshData | null>(null);
   const [mesh2, setMesh2] = useState<MeshData | null>(null);
+  const [boundary, setBoundary] = useState<BoundaryPoint[] | null>(null);
   const [files1, setFiles1] = useState<File[]>([]);
   const [files2, setFiles2] = useState<File[]>([]);
   const [folderName1, setFolderName1] = useState<string>("");
@@ -51,8 +52,8 @@ const App: React.FC = () => {
   
   const fileInputRef1 = useRef<HTMLInputElement>(null);
   const fileInputRef2 = useRef<HTMLInputElement>(null);
+  const boundaryInputRef = useRef<HTMLInputElement>(null);
 
-  // 初始化检查缓存
   useEffect(() => {
     async function loadCache() {
       const g1 = await getCachedGrid('grid1');
@@ -65,7 +66,7 @@ const App: React.FC = () => {
         setMesh2({ vertexGroups: [], name: "缓存数据 - 第二期", origin: {x:0,y:0,z:0}, grid: g2 });
         setFolderName2("缓存 - 第二期");
       }
-      if (g1 || g2) setStatus("已为您恢复上次处理好的格网数据。");
+      if (g1 || g2) setStatus("已恢复上次处理好的格网数据。");
     }
     loadCache();
   }, []);
@@ -79,6 +80,18 @@ const App: React.FC = () => {
     else { setFiles2(allFiles); setFolderName2(path); setMesh2(null); }
     setError(null);
     setResult(null);
+  };
+
+  const handleBoundaryInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const pts = await BoundaryParser.parseCSV(file);
+      setBoundary(pts);
+      setStatus(`成功导入矿界：${pts.length} 个拐点`);
+    } catch (err) {
+      setError("矿界 CSV 解析失败，请检查格式。");
+    }
   };
 
   const selectFolder = async (index: 1 | 2) => {
@@ -114,7 +127,7 @@ const App: React.FC = () => {
         const g1 = await Gridifier.processFoldersToGrid(objs1, meta1, gridSize, setStatus);
         await cacheGrid('grid1', g1);
         setMesh1({ vertexGroups: [], name: folderName1, origin: meta1, grid: g1 });
-        setFiles1([]); // 处理完清空，表示已经网格化完成
+        setFiles1([]); 
       }
 
       if (files2.length > 0) {
@@ -124,7 +137,7 @@ const App: React.FC = () => {
         const g2 = await Gridifier.processFoldersToGrid(objs2, meta2, gridSize, setStatus);
         await cacheGrid('grid2', g2);
         setMesh2({ vertexGroups: [], name: folderName2, origin: meta2, grid: g2 });
-        setFiles2([]); // 处理完清空
+        setFiles2([]);
       }
 
       setStatus("网格化处理完成！");
@@ -163,8 +176,8 @@ const App: React.FC = () => {
     <div className="flex h-screen w-full bg-slate-900 text-white overflow-hidden font-sans">
       <input type="file" ref={fileInputRef1} className="hidden" {...({ webkitdirectory: "", directory: "" } as any)} onChange={(e) => handleStandardInput(e, 1)} />
       <input type="file" ref={fileInputRef2} className="hidden" {...({ webkitdirectory: "", directory: "" } as any)} onChange={(e) => handleStandardInput(e, 2)} />
+      <input type="file" ref={boundaryInputRef} className="hidden" accept=".csv" onChange={handleBoundaryInput} />
       
-      {/* 导入中的全屏遮罩 */}
       {calculating && (
         <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex flex-col items-center justify-center">
           <div className="w-20 h-20 border-4 border-blue-500/20 border-t-blue-500 rounded-full animate-spin mb-6"></div>
@@ -191,48 +204,46 @@ const App: React.FC = () => {
           <div className="flex items-center gap-3">
             <button onClick={() => selectFolder(1)} className={`px-4 py-2 rounded-lg border text-xs transition-all flex items-center gap-2 ${mesh1 ? 'border-blue-500 bg-blue-500/10' : 'border-slate-600 bg-slate-700'}`}>
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
-              {folderName1 || "选择第一期"}
+              {folderName1 || "第一期 (基础)"}
             </button>
             <button onClick={() => selectFolder(2)} className={`px-4 py-2 rounded-lg border text-xs transition-all flex items-center gap-2 ${mesh2 ? 'border-red-500 bg-red-500/10' : 'border-slate-600 bg-slate-700'}`}>
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
-              {folderName2 || "选择第二期"}
+              {folderName2 || "第二期 (对比)"}
+            </button>
+            <button onClick={() => boundaryInputRef.current?.click()} className={`px-4 py-2 rounded-lg border text-xs transition-all flex items-center gap-2 ${boundary ? 'border-yellow-500 bg-yellow-500/10' : 'border-slate-600 bg-slate-700'}`}>
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+              {boundary ? "矿界已导入" : "导入矿界 CSV"}
             </button>
           </div>
         </div>
 
         <div className="flex items-center gap-4">
-          {/* 步骤 1: 网格化处理 */}
           {(files1.length > 0 || files2.length > 0) && (
             <button 
               onClick={processFiles}
               className="px-6 py-2.5 rounded-xl font-bold text-sm bg-indigo-600 hover:bg-indigo-500 shadow-lg shadow-indigo-500/20 transition-all flex items-center gap-2"
             >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
               解析并网格化
             </button>
           )}
 
-          {/* 步骤 2: 计算对比 */}
           {mesh1 && mesh2 && files1.length === 0 && files2.length === 0 && (
             <button 
               onClick={runAnalysis}
               className="px-6 py-2.5 rounded-xl font-bold text-sm bg-blue-600 hover:bg-blue-500 transition-all shadow-lg shadow-blue-500/20 flex items-center gap-2"
             >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
               执行方量对比
             </button>
           )}
 
-          {mesh1 && mesh2 && (
-            <button onClick={clearCache} className="p-2 rounded-lg text-slate-500 hover:text-white transition-all" title="清空所有数据">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
-            </button>
-          )}
+          <button onClick={clearCache} className="p-2 rounded-lg text-slate-500 hover:text-white transition-all" title="清空所有数据">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+          </button>
         </div>
       </header>
 
       <main className="flex-1 relative mt-20 flex overflow-hidden">
-        <Visualizer mesh1={mesh1} mesh2={mesh2} result={result} />
+        <Visualizer mesh1={mesh1} mesh2={mesh2} result={result} boundary={boundary} />
         <AnalysisDashboard 
           result={result} 
           loading={calculating} 

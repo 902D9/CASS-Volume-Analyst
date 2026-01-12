@@ -7,6 +7,12 @@ export interface Point3D {
   z: number;
 }
 
+export interface BoundaryPoint {
+  id: string;
+  x: number; // Easting (东坐标)
+  y: number; // Northing (北坐标)
+}
+
 export interface GridData {
   minX: number;
   minY: number;
