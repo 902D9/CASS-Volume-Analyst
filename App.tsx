@@ -89,6 +89,7 @@ const App: React.FC = () => {
       const pts = await BoundaryParser.parseCSV(file);
       setBoundary(pts);
       setStatus(`成功导入矿界：${pts.length} 个拐点`);
+      setResult(null); // 矿界改变，需重新计算结果
     } catch (err) {
       setError("矿界 CSV 解析失败，请检查格式。");
     }
@@ -149,21 +150,33 @@ const App: React.FC = () => {
   };
 
   const runAnalysis = useCallback(() => {
-    if (!mesh1?.grid || !mesh2?.grid) return;
+    // 前置检测
+    if (!mesh1?.grid || !mesh2?.grid) {
+      setError("请先解析并完成两期数据的网格化。");
+      return;
+    }
+    if (!boundary || boundary.length < 3) {
+      setError("请先导入合法的矿界多边形 CSV 文件。");
+      return;
+    }
+
     setCalculating(true);
-    setStatus("执行方量对比算法...");
+    setStatus("执行边界内方量对比算法...");
+    setError(null);
+
     setTimeout(() => {
       try {
-        const volumeResult = VolumeCalculator.calculate(mesh1, mesh2, gridSize);
+        // 传入 boundary 参数执行裁剪计算
+        const volumeResult = VolumeCalculator.calculate(mesh1, mesh2, boundary, gridSize);
         setResult(volumeResult);
-        setStatus("对比分析完成。");
+        setStatus("矿界内对比分析完成。");
       } catch (err) {
         setError(`对比失败: ${err instanceof Error ? err.message : '检查数据范围'}`);
       } finally {
         setCalculating(false);
       }
     }, 100);
-  }, [mesh1, mesh2, gridSize]);
+  }, [mesh1, mesh2, boundary, gridSize]);
 
   const clearCache = async () => {
     const db = await openDB();

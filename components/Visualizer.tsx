@@ -18,9 +18,20 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
   const controlsRef = useRef<OrbitControls | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
 
+  // 判定点是否在多边形内 (用于渲染过滤)
+  const isInside = (x: number, y: number, poly: BoundaryPoint[]) => {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i].x, yi = poly[i].y;
+      const xj = poly[j].x, yj = poly[j].y;
+      const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  };
+
   useEffect(() => {
     if (!mountRef.current) return;
-
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x020617); 
     sceneRef.current = scene;
@@ -29,10 +40,7 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     camera.position.set(400, 400, 400);
     cameraRef.current = camera;
 
-    const renderer = new THREE.WebGLRenderer({ 
-      antialias: true, 
-      logarithmicDepthBuffer: true,
-    });
+    const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
     mountRef.current.appendChild(renderer.domElement);
@@ -70,19 +78,26 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     };
   }, []);
 
-  const createBaseModel = (grid: GridData, origin: Point3D) => {
+  const createClippedModel = (grid: GridData, origin: Point3D, poly: BoundaryPoint[] | null) => {
     const { heights, rows, cols, minX, minY, gridSize } = grid;
     const positions: number[] = [];
     const indices: number[] = [];
     const NO_DATA = -1000000;
 
+    // 预计算顶点是否在界内
+    const vertexInside = new Uint8Array(rows * cols);
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
-        const h = heights[r * cols + c];
+        const idx = r * cols + c;
+        const x = minX + c * gridSize;
+        const y = minY + r * gridSize;
+        vertexInside[idx] = (poly === null || isInside(x, y, poly)) ? 1 : 0;
+
+        const h = heights[idx];
         positions.push(
-          (minX + c * gridSize) - origin.x,
+          x - origin.x,
           (h <= NO_DATA ? -10 : h - origin.z), 
-          -((minY + r * gridSize) - origin.y)
+          -(y - origin.y)
         );
       }
     }
@@ -94,9 +109,13 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
         const i2 = (r + 1) * cols + c;
         const i3 = (r + 1) * cols + (c + 1);
 
-        if (heights[i0] > -900000 && heights[i1] > -900000 && 
-            heights[i2] > -900000 && heights[i3] > -900000) {
+        // 只有三角形的三个顶点都在界内且有数据时才生成面
+        if (vertexInside[i0] && vertexInside[i1] && vertexInside[i2] &&
+            heights[i0] > -900000 && heights[i1] > -900000 && heights[i2] > -900000) {
           indices.push(i0, i2, i1);
+        }
+        if (vertexInside[i1] && vertexInside[i2] && vertexInside[i3] &&
+            heights[i1] > -900000 && heights[i2] > -900000 && heights[i3] > -900000) {
           indices.push(i1, i2, i3);
         }
       }
@@ -106,27 +125,15 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
-
-    const material = new THREE.MeshStandardMaterial({
-      color: 0x475569,
-      side: THREE.DoubleSide,
-      flatShading: false,
-      roughness: 0.7,
-      metalness: 0.1,
-      polygonOffset: true,
-      polygonOffsetFactor: 2,
-      polygonOffsetUnits: 2
-    });
-
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.name = 'phase2_model';
-    return mesh;
+    return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+      color: 0x475569, side: THREE.DoubleSide, roughness: 0.7, metalness: 0.1,
+      polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2
+    }));
   };
 
   useEffect(() => {
     if (!sceneRef.current || !controlsRef.current || !cameraRef.current) return;
 
-    // 清理旧物体
     ['grid1', 'grid2', 'result_viz', 'phase2_model', 'boundary_walls', 'boundary_top_line'].forEach(name => {
       const obj = sceneRef.current?.getObjectByName(name);
       if (obj) {
@@ -139,7 +146,6 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
       }
     });
 
-    // 寻找参考原点
     let refOrigin: Point3D = { x: 0, y: 0, z: 0 };
     if (mesh1?.grid) {
       refOrigin = { x: mesh1.grid.minX, y: mesh1.grid.minY, z: mesh1.grid.heights.find(h => h > -900000) || 0 };
@@ -149,14 +155,12 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
       refOrigin = { x: boundary[0].x, y: boundary[0].y, z: 0 };
     }
 
-    // 2. 渲染矿界“围栏墙”
+    // 渲染围栏
     if (boundary && boundary.length > 0) {
-      const wallHeight = 40; // 围栏高度(米)
+      const wallHeight = 40;
       const positions: number[] = [];
       const indices: number[] = [];
       const linePoints: THREE.Vector3[] = [];
-
-      // 获取特定坐标的高程
       const getZ = (x: number, y: number) => {
         if (!mesh2?.grid) return 0;
         const { minX, minY, gridSize, cols, rows, heights } = mesh2.grid;
@@ -168,141 +172,93 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
         }
         return 0;
       };
-
-      // 闭合点处理
       const fullBoundary = [...boundary, boundary[0]];
-
       for (let i = 0; i < fullBoundary.length; i++) {
         const p = fullBoundary[i];
-        const localX = p.x - refOrigin.x;
-        const localZ = -(p.y - refOrigin.y);
-        const groundY = getZ(p.x, p.y);
-        const topY = groundY + wallHeight;
-
-        // 墙壁顶点
-        positions.push(localX, groundY, localZ); // 底部顶点
-        positions.push(localX, topY, localZ);    // 顶部顶点
-        
-        linePoints.push(new THREE.Vector3(localX, topY + 0.2, localZ));
-
+        const lx = p.x - refOrigin.x;
+        const lz = -(p.y - refOrigin.y);
+        const gy = getZ(p.x, p.y);
+        const ty = gy + wallHeight;
+        positions.push(lx, gy, lz, lx, ty, lz);
+        linePoints.push(new THREE.Vector3(lx, ty + 0.2, lz));
         if (i < fullBoundary.length - 1) {
-          const curr = i * 2;
-          const next = (i + 1) * 2;
-          // 两个三角形组成一个矩形墙面
-          indices.push(curr, next, curr + 1);
-          indices.push(curr + 1, next, next + 1);
+          const c = i * 2, n = (i + 1) * 2;
+          indices.push(c, n, c + 1, c + 1, n, n + 1);
         }
       }
-
-      // 墙体 Mesh
       const wallGeo = new THREE.BufferGeometry();
       wallGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
       wallGeo.setIndex(indices);
       wallGeo.computeVertexNormals();
-
-      const wallMat = new THREE.MeshStandardMaterial({
-        color: 0xfacc15,
-        transparent: true,
-        opacity: 0.3,
-        side: THREE.DoubleSide,
-        emissive: 0xfacc15,
-        emissiveIntensity: 0.2,
-      });
-
-      const wallMesh = new THREE.Mesh(wallGeo, wallMat);
+      const wallMesh = new THREE.Mesh(wallGeo, new THREE.MeshStandardMaterial({
+        color: 0xfacc15, transparent: true, opacity: 0.3, side: THREE.DoubleSide, emissive: 0xfacc15, emissiveIntensity: 0.2
+      }));
       wallMesh.name = 'boundary_walls';
       sceneRef.current.add(wallMesh);
-
-      // 墙顶高亮线
-      const lineGeo = new THREE.BufferGeometry().setFromPoints(linePoints);
-      const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
-      const topLine = new THREE.Line(lineGeo, lineMat);
+      const topLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(linePoints), new THREE.LineBasicMaterial({ color: 0xffffff }));
       topLine.name = 'boundary_top_line';
       sceneRef.current.add(topLine);
     }
 
-    // 3. 渲染分析结果
+    // 渲染分析结果 (仅在界内)
     if (result && mesh2?.grid) {
-      const baseModel = createBaseModel(mesh2.grid, refOrigin);
+      const baseModel = createClippedModel(mesh2.grid, refOrigin, boundary);
+      baseModel.name = 'phase2_model';
       sceneRef.current.add(baseModel);
 
       const { diffMap, gridSize } = result;
-      const { data, rows, cols, minX, minY } = diffMap;
-      const positions: number[] = [];
-      const colors: number[] = [];
-      
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          const diff = data[r * cols + c];
-          if (Math.abs(diff) < 0.01) continue; 
-
-          const px = (minX + c * gridSize) - refOrigin.x;
-          const py = -((minY + r * gridSize) - refOrigin.y); 
-          const h2 = mesh2.grid.heights[r * cols + c];
-          if (h2 < -900000) continue;
+      const pos: number[] = [], col: number[] = [];
+      for (let r = 0; r < diffMap.rows; r++) {
+        for (let c = 0; c < diffMap.cols; c++) {
+          const d = diffMap.data[r * diffMap.cols + c];
+          if (Math.abs(d) < 0.01) continue;
+          const x = diffMap.minX + c * gridSize;
+          const y = diffMap.minY + r * gridSize;
           
-          const pz = h2 - refOrigin.z + 0.08; 
+          // result 本身已经过过滤，但为了视觉严谨再次校验
+          if (boundary && !isInside(x, y, boundary)) continue;
 
-          positions.push(px, pz, py);
-
-          if (diff > 0.05) colors.push(0.9, 0.2, 0.2); 
-          else if (diff < -0.05) colors.push(0.2, 0.4, 0.9);
-          else colors.push(0.4, 0.4, 0.4);
+          const h2 = mesh2.grid.heights[r * diffMap.cols + c];
+          if (h2 < -900000) continue;
+          pos.push(x - refOrigin.x, h2 - refOrigin.z + 0.1, -(y - refOrigin.y));
+          if (d > 0.05) col.push(0.9, 0.2, 0.2);
+          else if (d < -0.05) col.push(0.2, 0.4, 0.9);
+          else col.push(0.4, 0.4, 0.4);
         }
       }
-
-      if (positions.length > 0) {
-        const geometry = new THREE.BufferGeometry();
-        geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-        const material = new THREE.PointsMaterial({ 
-          vertexColors: true, 
-          size: gridSize * 0.9, 
-          sizeAttenuation: true,
-          depthWrite: false
-        });
-        const viz = new THREE.Points(geometry, material);
+      if (pos.length > 0) {
+        const geo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)).setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+        const viz = new THREE.Points(geo, new THREE.PointsMaterial({ vertexColors: true, size: gridSize * 0.9, sizeAttenuation: true, depthWrite: false }));
         viz.name = 'result_viz';
         sceneRef.current.add(viz);
-
         const box = new THREE.Box3().setFromObject(viz);
-        const center = box.getCenter(new THREE.Vector3());
-        controlsRef.current.target.copy(center);
+        controlsRef.current.target.copy(box.getCenter(new THREE.Vector3()));
         controlsRef.current.update();
       }
     } 
-    // 4. 预览阶段
+    // 预览阶段
     else {
       const renderPreview = (grid: GridData, color: number, name: string) => {
-        const { heights, rows, cols, minX, minY, gridSize } = grid;
         const pos: number[] = [];
-        for(let i=0; i<heights.length; i++) {
-          if (heights[i] < -900000) continue;
-          const r = Math.floor(i / cols);
-          const c = i % cols;
-          pos.push(
-            (minX + c*gridSize) - refOrigin.x, 
-            heights[i] - refOrigin.z, 
-            -((minY + r*gridSize) - refOrigin.y)
-          );
+        for(let i=0; i<grid.heights.length; i++) {
+          if (grid.heights[i] < -900000) continue;
+          const r = Math.floor(i / grid.cols), c = i % grid.cols;
+          const x = grid.minX + c*grid.gridSize, y = grid.minY + r*grid.gridSize;
+          if (boundary && !isInside(x, y, boundary)) continue;
+          pos.push(x - refOrigin.x, grid.heights[i] - refOrigin.z, -(y - refOrigin.y));
         }
         if (pos.length === 0) return null;
-        const geo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-        const mat = new THREE.PointsMaterial({ color, size: gridSize * 0.5 });
-        const p = new THREE.Points(geo, mat);
+        const p = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)), new THREE.PointsMaterial({ color, size: grid.gridSize * 0.5 }));
         p.name = name;
         sceneRef.current?.add(p);
         return p;
       };
-
-      let focusObj: THREE.Object3D | null = sceneRef.current.getObjectByName('boundary_walls') || null;
-      if (mesh1?.grid) focusObj = renderPreview(mesh1.grid, 0x3b82f6, 'grid1') || focusObj;
-      if (mesh2?.grid) focusObj = renderPreview(mesh2.grid, 0xef4444, 'grid2') || focusObj;
-      
-      if (focusObj) {
-        const box = new THREE.Box3().setFromObject(focusObj);
-        const center = box.getCenter(new THREE.Vector3());
-        controlsRef.current.target.copy(center);
+      let focus = sceneRef.current.getObjectByName('boundary_walls') || null;
+      if (mesh1?.grid) focus = renderPreview(mesh1.grid, 0x3b82f6, 'grid1') || focus;
+      if (mesh2?.grid) focus = renderPreview(mesh2.grid, 0xef4444, 'grid2') || focus;
+      if (focus) {
+        const box = new THREE.Box3().setFromObject(focus);
+        controlsRef.current.target.copy(box.getCenter(new THREE.Vector3()));
         controlsRef.current.update();
       }
     }
