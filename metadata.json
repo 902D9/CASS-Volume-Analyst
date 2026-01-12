@@ -1,0 +1,5 @@
+{
+  "name": "CASS-Pro Volume Analyst",
+  "description": "A professional-grade tool for 3D oblique photography volume comparison, mimicking Southern CASS DTM grid algorithms for precise cut and fill calculations between two epochs.",
+  "requestFramePermissions": []
+}
