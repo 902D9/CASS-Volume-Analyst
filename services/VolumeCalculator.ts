@@ -1,56 +1,56 @@
 
-import { MeshData, VolumeResult, HeightDiffGrid } from '../types';
+import { MeshData, VolumeResult, HeightDiffGrid, GridData } from '../types';
 
 export class VolumeCalculator {
   static calculate(mesh1: MeshData, mesh2: MeshData, gridSize: number = 1.0): VolumeResult {
-    // 1. Get Global Bounding Boxes
-    const box1 = this.getGlobalBoundingBox(mesh1);
-    const box2 = this.getGlobalBoundingBox(mesh2);
+    if (mesh1.grid && mesh2.grid) {
+      return this.calculateFromGrids(mesh1.grid, mesh2.grid);
+    }
+    throw new Error("请先完成两期数据的网格化预处理。");
+  }
 
-    // 2. Find intersection
-    const minX = Math.max(box1.minX, box2.minX);
-    const minY = Math.max(box1.minY, box2.minY);
-    const maxX = Math.min(box1.maxX, box2.maxX);
-    const maxY = Math.min(box1.maxY, box2.maxY);
+  private static calculateFromGrids(grid1: GridData, grid2: GridData): VolumeResult {
+    const minX = Math.max(grid1.minX, grid2.minX);
+    const minY = Math.max(grid1.minY, grid2.minY);
+    const maxX = Math.min(grid1.maxX, grid2.maxX);
+    const maxY = Math.min(grid1.maxY, grid2.maxY);
 
     if (maxX <= minX || maxY <= minY) {
-      throw new Error("模型在地理空间上没有交集，请检查 metadata.xml 的坐标原点。");
+      throw new Error("两期数据的地理空间范围无交集，无法对比。");
     }
 
+    const gridSize = grid1.gridSize; 
     const cols = Math.ceil((maxX - minX) / gridSize);
     const rows = Math.ceil((maxY - minY) / gridSize);
-
-    // Limit grid size to prevent OOM
-    if (cols * rows > 4000000) {
-      throw new Error(`格网数量过大 (${cols}x${rows})，请增大方格网间距。`);
-    }
-
-    // 3. Generate Height Maps (Using geographic coordinates)
-    const heightMap1 = this.generateHeightMap(mesh1, minX, minY, maxX, maxY, gridSize);
-    const heightMap2 = this.generateHeightMap(mesh2, minX, minY, maxX, maxY, gridSize);
 
     let cutVolume = 0;
     let fillVolume = 0;
     const diffData = new Float32Array(rows * cols);
     const cellArea = gridSize * gridSize;
+    const NO_DATA = -1000000;
 
-    for (let i = 0; i < rows * cols; i++) {
-      const h1 = heightMap1[i];
-      const h2 = heightMap2[i];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const x = minX + c * gridSize;
+        const y = minY + r * gridSize;
 
-      // -1e9 is our "NO DATA" flag
-      if (h1 < -999999 || h2 < -999999) {
-        diffData[i] = 0;
-        continue;
-      }
+        const h1 = this.getHeightWithFallback(grid1, x, y);
+        const h2 = this.getHeightWithFallback(grid2, x, y);
 
-      const diff = h2 - h1;
-      diffData[i] = diff;
+        const idx = r * cols + c;
+        if (h1 === NO_DATA || h2 === NO_DATA) {
+          diffData[idx] = 0;
+          continue;
+        }
 
-      if (diff > 0) {
-        fillVolume += diff * cellArea;
-      } else {
-        cutVolume += Math.abs(diff) * cellArea;
+        const diff = h2 - h1;
+        diffData[idx] = diff;
+
+        if (diff > 0) {
+          fillVolume += diff * cellArea;
+        } else {
+          cutVolume += Math.abs(diff) * cellArea;
+        }
       }
     }
 
@@ -67,79 +67,30 @@ export class VolumeCalculator {
     };
   }
 
-  private static getGlobalBoundingBox(mesh: MeshData) {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    const { origin, vertexGroups } = mesh;
+  /**
+   * 带有容错的高度查询
+   */
+  private static getHeightWithFallback(grid: GridData, x: number, y: number): number {
+    const c = Math.round((x - grid.minX) / grid.gridSize);
+    const r = Math.round((y - grid.minY) / grid.gridSize);
+    const NO_DATA = -1000000;
 
-    for (const vertices of vertexGroups) {
-      for (let i = 0; i < vertices.length; i += 3) {
-        const x = vertices[i] + origin.x;
-        const y = vertices[i + 1] + origin.y;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-      }
-    }
-    return { minX, minY, maxX, maxY };
-  }
-
-  private static generateHeightMap(
-    mesh: MeshData, 
-    minX: number, 
-    minY: number, 
-    maxX: number, 
-    maxY: number, 
-    gridSize: number
-  ): Float32Array {
-    const cols = Math.ceil((maxX - minX) / gridSize);
-    const rows = Math.ceil((maxY - minY) / gridSize);
-    const grid = new Float32Array(rows * cols).fill(-1000000); // Using large negative as flag
-    
-    const { origin, vertexGroups } = mesh;
-
-    for (const vertices of vertexGroups) {
-      for (let i = 0; i < vertices.length; i += 3) {
-        const x = vertices[i] + origin.x;
-        const y = vertices[i + 1] + origin.y;
-        const z = vertices[i + 2] + origin.z;
-
-        if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
-          const c = Math.floor((x - minX) / gridSize);
-          const r = Math.floor((y - minY) / gridSize);
-
-          if (r >= 0 && r < rows && c >= 0 && c < cols) {
-            const idx = r * cols + c;
-            // DTM logic: usually take the highest point in the cell for grid method
-            if (z > grid[idx]) {
-              grid[idx] = z;
-            }
+    if (r >= 0 && r < grid.rows && c >= 0 && c < grid.cols) {
+      const val = grid.heights[r * grid.cols + c];
+      if (val !== NO_DATA) return val;
+      
+      // 如果当前格网点无数据，尝试搜索极近距离（1格以内）的有效点
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          const nr = r + dr;
+          const nc = c + dc;
+          if (nr >= 0 && nr < grid.rows && nc >= 0 && nc < grid.cols) {
+            const nVal = grid.heights[nr * grid.cols + nc];
+            if (nVal !== NO_DATA) return nVal;
           }
         }
       }
     }
-
-    // Basic interpolation for small holes
-    for (let r = 1; r < rows - 1; r++) {
-      for (let c = 1; c < cols - 1; c++) {
-        const idx = r * cols + c;
-        if (grid[idx] < -999999) {
-          let sum = 0, count = 0;
-          const neighbors = [
-            grid[(r-1)*cols + c], grid[(r+1)*cols + c], 
-            grid[r*cols + (c-1)], grid[r*cols + (c+1)]
-          ];
-          for (const h of neighbors) {
-            if (h > -999999) {
-              sum += h;
-              count++;
-            }
-          }
-          if (count > 0) grid[idx] = sum / count;
-        }
-      }
-    }
-
-    return grid;
+    return NO_DATA;
   }
 }

@@ -3,8 +3,7 @@ import { MeshData, GridData, Point3D } from '../types';
 
 export class Gridifier {
   /**
-   * 采用真正的流式处理：通过 ReadableStream 分块读取文件
-   * 避免了 file.text() 在处理大文件时的内存溢出和长度限制问题
+   * 采用流式处理并增加孔洞填充逻辑
    */
   static async processFoldersToGrid(
     files: File[], 
@@ -26,28 +25,32 @@ export class Gridifier {
     }
 
     if (minX === Infinity) {
-      throw new Error("在所选 OBJ 文件中未发现有效顶点数据。请确保文件格式正确（文本格式 OBJ）。");
+      throw new Error("在所选 OBJ 文件中未发现有效顶点数据。");
     }
 
     // 2. 初始化格网
     const cols = Math.ceil((maxX - minX) / gridSize) + 1;
     const rows = Math.ceil((maxY - minY) / gridSize) + 1;
     
-    // 限制格网总数，防止浏览器显存溢出 (约 500万个点)
     if (cols * rows > 5000000) {
-      throw new Error(`格网规模太大 (${cols}x${rows})，建议增大网格间距（当前 ${gridSize}m）。`);
+      throw new Error(`格网规模太大 (${cols}x${rows})，建议增大网格间距。`);
     }
 
     onProgress?.(`初始化格网: ${cols} x ${rows}`);
     const heights = new Float32Array(rows * cols).fill(-1000000);
 
-    // 3. 第二遍扫描：填充格网 (南方CASS DTM 采样逻辑：保留格网内最高点)
+    // 3. 第二遍扫描：填充格网 (保留格网内最高点，符合倾斜摄影地表提取逻辑)
     let count = 0;
     for (const file of files) {
       count++;
       onProgress?.(`正在网格化: ${count} / ${files.length} (${file.name})`);
       await this.streamPopulateGrid(file, origin, heights, minX, minY, cols, rows, gridSize);
     }
+
+    // 4. 关键：孔洞填充处理 (Hole Filling)
+    // 解决采样点稀疏导致的格网空洞
+    onProgress?.("正在内插修复格网孔洞...");
+    this.fillHoles(heights, rows, cols);
 
     return {
       minX, minY, maxX, maxY,
@@ -58,11 +61,52 @@ export class Gridifier {
   }
 
   /**
-   * 使用流式读取扫描边界
+   * 简单的邻域内插填充算法
+   * 对于没有值的点，查看周围 8 邻域，如果有超过 2 个邻居有值，则取均值
    */
+  private static fillHoles(grid: Float32Array, rows: number, cols: number) {
+    const NO_DATA = -1000000;
+    // 使用副本防止扩散污染（单次迭代即可修复大部分小孔洞）
+    const copy = new Float32Array(grid);
+    
+    // 执行两轮填充以应对较大孔洞
+    for (let pass = 0; pass < 2; pass++) {
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const idx = r * cols + c;
+          if (grid[idx] !== NO_DATA) continue;
+
+          let sum = 0;
+          let count = 0;
+
+          // 检查 8 邻域
+          for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+              if (dr === 0 && dc === 0) continue;
+              const nr = r + dr;
+              const nc = c + dc;
+              if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) {
+                const nVal = grid[nr * cols + nc];
+                if (nVal !== NO_DATA) {
+                  sum += nVal;
+                  count++;
+                }
+              }
+            }
+          }
+
+          // 如果周围有数据，则内插
+          if (count >= 2) {
+            copy[idx] = sum / count;
+          }
+        }
+      }
+      grid.set(copy);
+    }
+  }
+
   private static async streamScanBounds(file: File, origin: Point3D) {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    
     await this.readFileByLines(file, (line) => {
       if (line.startsWith('v ')) {
         const parts = line.split(/\s+/);
@@ -74,13 +118,9 @@ export class Gridifier {
         }
       }
     });
-    
     return { minX, minY, maxX, maxY };
   }
 
-  /**
-   * 使用流式读取填充格网
-   */
   private static async streamPopulateGrid(
     file: File, 
     origin: Point3D, 
@@ -104,6 +144,7 @@ export class Gridifier {
 
           if (r >= 0 && r < rows && c >= 0 && c < cols) {
             const idx = r * cols + c;
+            // 倾斜摄影地表提取通常取格网内最大 Z 值以排除地面杂物干扰（CASS 常用逻辑）
             if (z > grid[idx]) {
               grid[idx] = z;
             }
@@ -113,10 +154,6 @@ export class Gridifier {
     });
   }
 
-  /**
-   * 核心辅助方法：流式按行读取文件
-   * 这种方法内存占用极低
-   */
   private static async readFileByLines(file: File, onLine: (line: string) => void) {
     const reader = file.stream().getReader();
     const decoder = new TextDecoder();
@@ -128,19 +165,12 @@ export class Gridifier {
 
       const chunk = decoder.decode(value, { stream: true });
       const lines = (partialLine + chunk).split(/\r?\n/);
-      
-      // 最后一部分可能是不完整的行，留到下个块处理
       partialLine = lines.pop() || '';
 
       for (const line of lines) {
-        if (line.length > 0) {
-          onLine(line);
-        }
+        if (line.length > 0) onLine(line);
       }
     }
-
-    if (partialLine.length > 0) {
-      onLine(partialLine);
-    }
+    if (partialLine.length > 0) onLine(partialLine);
   }
 }
