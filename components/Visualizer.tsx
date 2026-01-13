@@ -29,10 +29,7 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     camera.position.set(1000, 1000, 1000);
     cameraRef.current = camera;
 
-    const renderer = new THREE.WebGLRenderer({ 
-      antialias: true, 
-      logarithmicDepthBuffer: true 
-    });
+    const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
     mountRef.current.appendChild(renderer.domElement);
@@ -40,7 +37,6 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    controls.dampingFactor = 0.05;
     controlsRef.current = controls;
 
     scene.add(new THREE.AmbientLight(0xffffff, 0.8));
@@ -69,35 +65,42 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     };
   }, []);
 
-  const createFullGridGroup = (grid: GridData, origin: Point3D, color: number, diffData?: Float32Array) => {
-    const { heights, rows, cols, minX, minY, gridSize } = grid;
+  const createRotatedGridGroup = (grid: GridData, globalOrigin: Point3D, color: number, diffData?: Float32Array) => {
+    const { heights, rows, cols, minX, minY, gridSize, rotationAngle, anchor } = grid;
     const positions: number[] = [];
     const nodeColors: number[] = [];
     const NO_DATA = -1000000;
+
+    const cos = Math.cos(rotationAngle);
+    const sin = Math.sin(rotationAngle);
 
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const idx = r * cols + c;
         const h = heights[idx];
-        const gx = minX + c * gridSize;
-        const gy = minY + r * gridSize;
-
-        const lx = gx - origin.x;
-        const lz = -(gy - origin.y); // 地理北向映射到 -Z
-        const ly = h - origin.z;
         
-        // 即使是无效数据也占位，但在索引阶段剔除
-        positions.push(lx, h <= NO_DATA ? -100 : ly, lz);
+        // 局部坐标系点
+        const lx = minX + c * gridSize;
+        const ly = minY + r * gridSize;
 
-        if (diffData) {
-          const d = diffData[idx];
-          if (d > 0.05) nodeColors.push(0.9, 0.2, 0.2); // 填方红
-          else if (d < -0.05) nodeColors.push(0.2, 0.4, 0.9); // 挖方蓝
+        // 旋转回全局坐标
+        const gx = lx * cos - ly * sin + anchor.x;
+        const gy = lx * sin + ly * cos + anchor.y;
+
+        // 相对于场景原点 (globalOrigin) 的显示坐标
+        const dx = gx - globalOrigin.x;
+        const dz = -(gy - globalOrigin.y);
+        const dy = (h <= NO_DATA ? -50 : h) - globalOrigin.z;
+
+        positions.push(dx, dy, dz);
+
+        if (diffData && h > NO_DATA) {
+          const d = diffData[idx] || 0;
+          if (d > 0.05) nodeColors.push(0.9, 0.2, 0.2);
+          else if (d < -0.05) nodeColors.push(0.2, 0.4, 0.9);
           else nodeColors.push(0.5, 0.5, 0.5);
         } else {
-          // 默认颜色：第一期蓝色系，第二期红色系
-          if (color === 0x3b82f6) nodeColors.push(0.2, 0.4, 0.8);
-          else nodeColors.push(0.8, 0.2, 0.2);
+          color === 0x3b82f6 ? nodeColors.push(0.2, 0.4, 0.8) : nodeColors.push(0.8, 0.2, 0.2);
         }
       }
     }
@@ -119,34 +122,22 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
-    // 1. 半透明实体
-    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ 
-      color: color, 
-      side: THREE.DoubleSide, 
-      transparent: true, 
-      opacity: 0.3 
-    }));
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, transparent: true, opacity: 0.3 }));
     group.add(mesh);
 
-    // 2. DTM 线框
-    const wireframe = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ 
-      color: color, 
-      wireframe: true, 
-      transparent: true, 
-      opacity: 0.4 
-    }));
+    const wireframe = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.4 }));
     wireframe.position.y += 0.02;
     group.add(wireframe);
 
-    // 3. 采样点云
-    const ptGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(positions, 3)).setAttribute('color', new THREE.Float32BufferAttribute(nodeColors, 3));
-    const points = new THREE.Points(ptGeo, new THREE.PointsMaterial({ 
-      vertexColors: true, 
-      size: 2, 
-      sizeAttenuation: true 
-    }));
-    points.position.y += 0.05;
-    group.add(points);
+    const ptPos: number[] = [], ptCol: number[] = [];
+    for(let i=0; i<heights.length; i++) {
+      if(heights[i] > NO_DATA) {
+        ptPos.push(positions[i*3], positions[i*3+1]+0.05, positions[i*3+2]);
+        ptCol.push(nodeColors[i*3], nodeColors[i*3+1], nodeColors[i*3+2]);
+      }
+    }
+    const ptGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(ptPos, 3)).setAttribute('color', new THREE.Float32BufferAttribute(ptCol, 3));
+    group.add(new THREE.Points(ptGeo, new THREE.PointsMaterial({ vertexColors: true, size: 2, sizeAttenuation: true })));
 
     return group;
   };
@@ -155,66 +146,47 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     const scene = sceneRef.current;
     if (!scene || !controlsRef.current) return;
 
-    // 清理场景
     ['model_1', 'model_2', 'boundary_line'].forEach(n => {
       const obj = scene.getObjectByName(n);
       if (obj) {
-        obj.traverse((c: any) => { 
-          if(c.geometry) c.geometry.dispose(); 
-          if(c.material) Array.isArray(c.material) ? c.material.forEach((m:any)=>m.dispose()) : c.material.dispose(); 
-        });
+        obj.traverse((c: any) => { if(c.geometry) c.geometry.dispose(); if(c.material) Array.isArray(c.material) ? c.material.forEach((m:any)=>m.dispose()) : c.material.dispose(); });
         scene.remove(obj);
       }
     });
 
-    // 计算全局参考原点：取第一期的范围起点
     let refOrigin: Point3D = { x: 0, y: 0, z: 0 };
-    if (mesh1?.grid) {
-      refOrigin = { x: mesh1.grid.minX, y: mesh1.grid.minY, z: mesh1.grid.heights.find(h => h > -900000) || 0 };
-    } else if (mesh2?.grid) {
-      refOrigin = { x: mesh2.grid.minX, y: mesh2.grid.minY, z: mesh2.grid.heights.find(h => h > -900000) || 0 };
-    } else if (boundary && boundary.length > 0) {
-      refOrigin = { x: boundary[0].x, y: boundary[0].y, z: 0 };
+    const baseGrid = mesh1?.grid || mesh2?.grid;
+    if (baseGrid) {
+      refOrigin = { x: baseGrid.anchor.x, y: baseGrid.anchor.y, z: baseGrid.anchor.z };
     }
 
-    // 1. 绘制第一期 (蓝色系)
     if (mesh1?.grid) {
-      const g1 = createFullGridGroup(mesh1.grid, refOrigin, 0x3b82f6);
+      const g1 = createRotatedGridGroup(mesh1.grid, refOrigin, 0x3b82f6);
       g1.name = 'model_1';
       scene.add(g1);
     }
-
-    // 2. 绘制第二期 (红色系)
     if (mesh2?.grid) {
-      // 如果有计算结果，传入差异数据进行着色
-      const g2 = createFullGridGroup(mesh2.grid, refOrigin, 0xef4444, result?.diffMap.data);
+      const g2 = createRotatedGridGroup(mesh2.grid, refOrigin, 0xef4444, result?.diffMap.data);
       g2.name = 'model_2';
       scene.add(g2);
     }
 
-    // 3. 绘制矿界线 (黄色)
     if (boundary && boundary.length >= 2) {
       const bPts: THREE.Vector3[] = [];
-      boundary.forEach(p => bPts.push(new THREE.Vector3(p.x - refOrigin.x, 1, -(p.y - refOrigin.y))));
-      if (boundary.length > 2) bPts.push(bPts[0]); // 闭合
+      boundary.forEach(p => bPts.push(new THREE.Vector3(p.x - refOrigin.x, 2, -(p.y - refOrigin.y))));
+      if (boundary.length > 2) bPts.push(bPts[0]);
       const bLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(bPts), new THREE.LineBasicMaterial({ color: 0xfacc15, linewidth: 3 }));
       bLine.name = 'boundary_line';
       scene.add(bLine);
     }
 
-    // 自动聚焦
     const allModels = scene.children.filter(c => c.name.startsWith('model_') || c.name === 'boundary_line');
     if (allModels.length > 0) {
-      const group = new THREE.Group();
-      allModels.forEach(m => group.add(m.clone())); // 临时组合计算包围盒
-      const box = new THREE.Box3().setFromObject(group);
+      const box = new THREE.Box3();
+      allModels.forEach(m => box.expandByObject(m));
       if (!box.isEmpty()) {
         const center = box.getCenter(new THREE.Vector3());
         controlsRef.current.target.copy(center);
-        // 如果是首次加载，调整相机位置
-        if (cameraRef.current && cameraRef.current.position.length() < 2000) {
-          cameraRef.current.position.set(center.x + 500, center.y + 500, center.z + 500);
-        }
         controlsRef.current.update();
       }
     }

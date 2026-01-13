@@ -1,42 +1,63 @@
 
-import { MeshData, GridData, Point3D } from '../types';
+import { MeshData, GridData, Point3D, BoundaryPoint } from '../types';
 
 export class Gridifier {
-  /**
-   * 采用流式处理并增加孔洞填充逻辑
-   */
   static async processFoldersToGrid(
     files: File[], 
     origin: Point3D, 
     gridSize: number,
+    boundary: BoundaryPoint[] | null,
     onProgress?: (msg: string) => void
   ): Promise<GridData> {
     
-    // 1. 第一遍扫描：确定全局 Bounding Box
-    onProgress?.("正在扫描地理范围...");
+    // 1. 计算旋转参数 (CASS 风格：平行于第一条边)
+    let rotationAngle = 0;
+    let anchor: Point3D = { ...origin };
+    if (boundary && boundary.length >= 2) {
+      const dx = boundary[1].x - boundary[0].x;
+      const dy = boundary[1].y - boundary[0].y;
+      rotationAngle = Math.atan2(dy, dx);
+      anchor = { x: boundary[0].x, y: boundary[0].y, z: origin.z };
+    }
+
+    const cos = Math.cos(-rotationAngle);
+    const sin = Math.sin(-rotationAngle);
+
+    // 2. 第一遍扫描：确定局部坐标系下的 Bounding Box
+    onProgress?.("正在扫描地理范围 (对齐边界)...");
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 
     for (const file of files) {
-      const bounds = await this.streamScanBounds(file, origin);
-      if (bounds.minX < minX) minX = bounds.minX;
-      if (bounds.minY < minY) minY = bounds.minY;
-      if (bounds.maxX > maxX) maxX = bounds.maxX;
-      if (bounds.maxY > maxY) maxY = bounds.maxY;
+      await this.readFileByLines(file, (line) => {
+        if (line.startsWith('v ')) {
+          const parts = line.split(/\s+/);
+          if (parts.length >= 4) {
+            const gx = parseFloat(parts[1]) + origin.x;
+            const gy = parseFloat(parts[2]) + origin.y;
+            
+            // 转换到局部坐标系
+            const lx = (gx - anchor.x) * cos - (gy - anchor.y) * sin;
+            const ly = (gx - anchor.x) * sin + (gy - anchor.y) * cos;
+
+            if (lx < minX) minX = lx; if (lx > maxX) maxX = lx;
+            if (ly < minY) minY = ly; if (ly > maxY) maxY = ly;
+          }
+        }
+      });
     }
 
-    if (minX === Infinity) {
-      throw new Error("在所选 OBJ 文件中未发现有效顶点数据。");
-    }
+    if (minX === Infinity) throw new Error("未发现有效顶点数据。");
 
-    // 2. 初始化格网 (增加冗余边距确保边界稳定)
-    const cols = Math.ceil((maxX - minX) / gridSize) + 2;
-    const rows = Math.ceil((maxY - minY) / gridSize) + 2;
+    // 增加冗余边距
+    minX -= gridSize; minY -= gridSize;
+    maxX += gridSize; maxY += gridSize;
+
+    const cols = Math.ceil((maxX - minX) / gridSize);
+    const rows = Math.ceil((maxY - minY) / gridSize);
     
-    if (cols * rows > 10000000) {
-      throw new Error(`格网规模过大 (${cols}x${rows})，请增大网格间距。`);
-    }
+    if (cols * rows > 10000000) throw new Error("格网规模过大，请增大网格间距。");
 
-    onProgress?.(`格网初始化: ${cols} x ${rows}`);
+    onProgress?.(`格网对齐完成: ${cols} x ${rows}`);
     const heights = new Float32Array(rows * cols).fill(-1000000);
 
     // 3. 第二遍扫描：采样
@@ -44,86 +65,51 @@ export class Gridifier {
     for (const file of files) {
       count++;
       onProgress?.(`点云网格化: ${count} / ${files.length}`);
-      await this.streamPopulateGrid(file, origin, heights, minX, minY, cols, rows, gridSize);
-    }
+      await this.readFileByLines(file, (line) => {
+        if (line.startsWith('v ')) {
+          const parts = line.split(/\s+/);
+          if (parts.length >= 4) {
+            const gx = parseFloat(parts[1]) + origin.x;
+            const gy = parseFloat(parts[2]) + origin.y;
+            const gz = parseFloat(parts[3]) + origin.z;
 
-    // 4. 填充
-    onProgress?.("优化格网完整度...");
-    this.fillHoles(heights, rows, cols);
+            const lx = (gx - anchor.x) * cos - (gy - anchor.y) * sin;
+            const ly = (gx - anchor.x) * sin + (gy - anchor.y) * cos;
 
-    return { minX, minY, maxX, maxY, rows, cols, gridSize, heights };
-  }
+            const c = Math.floor((lx - minX) / gridSize);
+            const r = Math.floor((ly - minY) / gridSize);
 
-  private static async streamScanBounds(file: File, origin: Point3D) {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    await this.readFileByLines(file, (line) => {
-      if (line.startsWith('v ')) {
-        const parts = line.split(/\s+/);
-        if (parts.length >= 4) {
-          const x = parseFloat(parts[1]) + origin.x;
-          const y = parseFloat(parts[2]) + origin.y;
-          if (x < minX) minX = x; if (x > maxX) maxX = x;
-          if (y < minY) minY = y; if (y > maxY) maxY = y;
-        }
-      }
-    });
-    return { minX, minY, maxX, maxY };
-  }
-
-  private static async streamPopulateGrid(
-    file: File, 
-    origin: Point3D, 
-    grid: Float32Array, 
-    minX: number, 
-    minY: number, 
-    cols: number, 
-    rows: number, 
-    gridSize: number
-  ) {
-    await this.readFileByLines(file, (line) => {
-      if (line.startsWith('v ')) {
-        const parts = line.split(/\s+/);
-        if (parts.length >= 4) {
-          const x = parseFloat(parts[1]) + origin.x;
-          const y = parseFloat(parts[2]) + origin.y;
-          const z = parseFloat(parts[3]) + origin.z;
-
-          // 使用 floor 保证格网位置的绝对稳定性
-          const c = Math.floor((x - minX) / gridSize);
-          const r = Math.floor((y - minY) / gridSize);
-
-          if (r >= 0 && r < rows && c >= 0 && c < cols) {
-            const idx = r * cols + c;
-            // 倾斜摄影地表提取通常取格网内最高 Z 值
-            if (z > grid[idx]) {
-              grid[idx] = z;
+            if (r >= 0 && r < rows && c >= 0 && c < cols) {
+              const idx = r * cols + c;
+              if (gz > heights[idx]) heights[idx] = gz;
             }
           }
         }
-      }
-    });
+      });
+    }
+
+    this.fillHoles(heights, rows, cols);
+    return { minX, minY, maxX, maxY, rows, cols, gridSize, heights, rotationAngle, anchor };
   }
 
   private static fillHoles(grid: Float32Array, rows: number, cols: number) {
     const NO_DATA = -1000000;
     const copy = new Float32Array(grid);
-    for (let pass = 0; pass < 1; pass++) {
-      for (let r = 1; r < rows - 1; r++) {
-        for (let c = 1; c < cols - 1; c++) {
-          const idx = r * cols + c;
-          if (grid[idx] !== NO_DATA) continue;
-          let sum = 0, count = 0;
-          for (let dr = -1; dr <= 1; dr++) {
-            for (let dc = -1; dc <= 1; dc++) {
-              const val = grid[(r+dr)*cols + (c+dc)];
-              if (val !== NO_DATA) { sum += val; count++; }
-            }
+    for (let r = 1; r < rows - 1; r++) {
+      for (let c = 1; c < cols - 1; c++) {
+        const idx = r * cols + c;
+        if (grid[idx] !== NO_DATA) continue;
+        let sum = 0, count = 0;
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            const val = grid[(r+dr)*cols + (c+dc)];
+            if (val !== NO_DATA) { sum += val; count++; }
           }
-          if (count >= 3) copy[idx] = sum / count;
         }
+        if (count >= 3) copy[idx] = sum / count;
       }
-      grid.set(copy);
     }
+    grid.set(copy);
   }
 
   private static async readFileByLines(file: File, onLine: (line: string) => void) {

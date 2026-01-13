@@ -14,14 +14,16 @@ export interface BoundaryPoint {
 }
 
 export interface GridData {
-  minX: number;
-  minY: number;
+  minX: number; // Local space
+  minY: number; // Local space
   maxX: number;
   maxY: number;
   rows: number;
   cols: number;
   gridSize: number;
-  heights: Float32Array; // Z values for each grid intersection
+  heights: Float32Array;
+  rotationAngle: number; // Rotation relative to global North
+  anchor: Point3D;       // Origin point for rotation
 }
 
 export interface VolumeResult {
@@ -47,5 +49,5 @@ export interface MeshData {
   vertexGroups: Float32Array[]; 
   name: string;
   origin: Point3D;
-  grid?: GridData; // Sampled grid for preview
+  grid?: GridData; 
 }
