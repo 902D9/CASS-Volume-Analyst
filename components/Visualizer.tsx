@@ -1,5 +1,5 @@
 
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
 import { VolumeResult, MeshData, GridData, BoundaryPoint, Point3D } from '../types';
@@ -11,31 +11,54 @@ interface Props {
   boundary: BoundaryPoint[] | null;
 }
 
+type ViewMode = 'TOP' | 'FRONT' | 'LEFT' | 'RIGHT' | 'ISO';
+type CameraType = 'PERSPECTIVE' | 'ORTHOGRAPHIC';
+
 export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) => {
   const mountRef = useRef<HTMLDivElement>(null);
-  const sceneRef = useRef<THREE.Scene | null>(null);
+  const sceneRef = useRef<THREE.Scene>(new THREE.Scene());
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
-  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  
+  const perspectiveCameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const orthographicCameraRef = useRef<THREE.OrthographicCamera | null>(null);
+  const [activeCameraType, setActiveCameraType] = useState<CameraType>('PERSPECTIVE');
+  
+  const boundsRef = useRef<THREE.Box3>(new THREE.Box3());
 
+  // Initialization: Only runs ONCE on mount
   useEffect(() => {
     if (!mountRef.current) return;
     
-    const scene = new THREE.Scene();
+    const scene = sceneRef.current;
     scene.background = new THREE.Color(0x020617); 
-    sceneRef.current = scene;
 
-    const camera = new THREE.PerspectiveCamera(45, mountRef.current.clientWidth / mountRef.current.clientHeight, 0.1, 10000000);
-    camera.position.set(1000, 1000, 1000);
-    cameraRef.current = camera;
+    const width = mountRef.current.clientWidth;
+    const height = mountRef.current.clientHeight;
+    const aspect = width / height;
+
+    // 1. Perspective Camera
+    const pCamera = new THREE.PerspectiveCamera(45, aspect, 0.1, 1000000);
+    pCamera.position.set(1000, 1000, 1000);
+    perspectiveCameraRef.current = pCamera;
+
+    // 2. Orthographic Camera
+    const frustumSize = 1000;
+    const oCamera = new THREE.OrthographicCamera(
+      frustumSize * aspect / -2, frustumSize * aspect / 2,
+      frustumSize / 2, frustumSize / -2,
+      0.1, 1000000
+    );
+    oCamera.position.set(1000, 1000, 1000);
+    orthographicCameraRef.current = oCamera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
     renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
+    renderer.setSize(width, height);
     mountRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    const controls = new OrbitControls(camera, renderer.domElement);
+    const controls = new OrbitControls(pCamera, renderer.domElement);
     controls.enableDamping = true;
     controlsRef.current = controls;
 
@@ -44,26 +67,136 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     sun.position.set(2000, 5000, 2000);
     scene.add(sun);
 
+    let animationId: number;
     const animate = () => {
-      requestAnimationFrame(animate);
+      animationId = requestAnimationFrame(animate);
       controls.update();
-      renderer.render(scene, camera);
+      
+      // Select camera based on current state (state ref is needed for the loop or just closure)
+      // Since setActiveCameraType triggers re-render, we use a ref for the type to be safe in the loop
+      // but standard React state works fine here if we handle it inside the loop correctly.
+      const activeCam = controls.object; 
+      // Fix: Cast controls.object to THREE.Camera as renderer.render expects a Camera type.
+      renderer.render(scene, activeCam as THREE.Camera);
     };
     animate();
 
     const handleResize = () => {
       if (!mountRef.current || !rendererRef.current) return;
-      camera.aspect = mountRef.current.clientWidth / mountRef.current.clientHeight;
-      camera.updateProjectionMatrix();
-      rendererRef.current.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
+      const w = mountRef.current.clientWidth;
+      const h = mountRef.current.clientHeight;
+      const asp = w / h;
+
+      pCamera.aspect = asp;
+      pCamera.updateProjectionMatrix();
+
+      // We update ortho camera if it's currently active or about to be
+      const fSize = getTargetFrustumSize();
+      oCamera.left = -fSize * asp / 2;
+      oCamera.right = fSize * asp / 2;
+      oCamera.top = fSize / 2;
+      oCamera.bottom = -fSize / 2;
+      oCamera.updateProjectionMatrix();
+
+      rendererRef.current.setSize(w, h);
     };
 
     window.addEventListener('resize', handleResize);
+    
     return () => {
+      cancelAnimationFrame(animationId);
       window.removeEventListener('resize', handleResize);
+      renderer.dispose();
       mountRef.current?.removeChild(renderer.domElement);
     };
   }, []);
+
+  const getTargetFrustumSize = () => {
+    if (boundsRef.current.isEmpty()) return 1000;
+    const size = new THREE.Vector3();
+    boundsRef.current.getSize(size);
+    return Math.max(size.x, size.y, size.z) * 1.5;
+  };
+
+  const syncCameras = (from: THREE.Camera, to: THREE.Camera) => {
+    to.position.copy(from.position);
+    to.quaternion.copy(from.quaternion);
+    if (controlsRef.current) {
+      to.lookAt(controlsRef.current.target);
+    }
+  };
+
+  const setView = (mode: ViewMode) => {
+    if (!perspectiveCameraRef.current || !orthographicCameraRef.current || !controlsRef.current) return;
+    
+    const targetType: CameraType = mode === 'ISO' ? 'PERSPECTIVE' : 'ORTHOGRAPHIC';
+    const target = controlsRef.current.target.clone();
+    
+    const size = new THREE.Vector3();
+    boundsRef.current.getSize(size);
+    const distance = Math.max(size.x, size.y, size.z) * 1.5 || 500;
+
+    const cam = targetType === 'PERSPECTIVE' ? perspectiveCameraRef.current : orthographicCameraRef.current;
+    controlsRef.current.object = cam;
+
+    if (targetType === 'ORTHOGRAPHIC') {
+      const oCam = cam as THREE.OrthographicCamera;
+      const asp = perspectiveCameraRef.current.aspect;
+      const fSize = getTargetFrustumSize();
+      oCam.left = -fSize * asp / 2;
+      oCam.right = fSize * asp / 2;
+      oCam.top = fSize / 2;
+      oCam.bottom = -fSize / 2;
+      oCam.updateProjectionMatrix();
+    }
+
+    switch (mode) {
+      case 'TOP':
+        cam.position.set(target.x, target.y + distance, target.z);
+        break;
+      case 'FRONT':
+        cam.position.set(target.x, target.y, target.z + distance);
+        break;
+      case 'LEFT':
+        cam.position.set(target.x - distance, target.y, target.z);
+        break;
+      case 'RIGHT':
+        cam.position.set(target.x + distance, target.y, target.z);
+        break;
+      case 'ISO':
+        const isoDist = distance * 0.707;
+        cam.position.set(target.x + isoDist, target.y + isoDist, target.z + isoDist);
+        break;
+    }
+    
+    cam.lookAt(target);
+    controlsRef.current.update();
+    setActiveCameraType(targetType);
+  };
+
+  const toggleCameraType = () => {
+    if (!perspectiveCameraRef.current || !orthographicCameraRef.current || !controlsRef.current) return;
+    
+    const nextType = activeCameraType === 'PERSPECTIVE' ? 'ORTHOGRAPHIC' : 'PERSPECTIVE';
+    const fromCam = activeCameraType === 'PERSPECTIVE' ? perspectiveCameraRef.current : orthographicCameraRef.current;
+    const toCam = nextType === 'PERSPECTIVE' ? perspectiveCameraRef.current : orthographicCameraRef.current;
+    
+    syncCameras(fromCam, toCam);
+    controlsRef.current.object = toCam;
+    
+    if (nextType === 'ORTHOGRAPHIC') {
+      const oCam = toCam as THREE.OrthographicCamera;
+      const fSize = getTargetFrustumSize();
+      const asp = perspectiveCameraRef.current.aspect;
+      oCam.left = -fSize * asp / 2;
+      oCam.right = fSize * asp / 2;
+      oCam.top = fSize / 2;
+      oCam.bottom = -fSize / 2;
+      oCam.updateProjectionMatrix();
+    }
+    
+    setActiveCameraType(nextType);
+  };
 
   const createRotatedGridGroup = (grid: GridData, globalOrigin: Point3D, color: number, diffData?: Float32Array) => {
     const { heights, rows, cols, minX, minY, gridSize, rotationAngle, anchor } = grid;
@@ -78,20 +211,13 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
       for (let c = 0; c < cols; c++) {
         const idx = r * cols + c;
         const h = heights[idx];
-        
-        // 局部坐标系点
         const lx = minX + c * gridSize;
         const ly = minY + r * gridSize;
-
-        // 旋转回全局坐标
         const gx = lx * cos - ly * sin + anchor.x;
         const gy = lx * sin + ly * cos + anchor.y;
-
-        // 相对于场景原点 (globalOrigin) 的显示坐标
         const dx = gx - globalOrigin.x;
         const dz = -(gy - globalOrigin.y);
         const dy = (h <= NO_DATA ? -50 : h) - globalOrigin.z;
-
         positions.push(dx, dy, dz);
 
         if (diffData && h > NO_DATA) {
@@ -142,6 +268,7 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     return group;
   };
 
+  // Content Update: Syncs meshes/boundary to the persistent scene
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene || !controlsRef.current) return;
@@ -149,7 +276,10 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     ['model_1', 'model_2', 'boundary_line'].forEach(n => {
       const obj = scene.getObjectByName(n);
       if (obj) {
-        obj.traverse((c: any) => { if(c.geometry) c.geometry.dispose(); if(c.material) Array.isArray(c.material) ? c.material.forEach((m:any)=>m.dispose()) : c.material.dispose(); });
+        obj.traverse((c: any) => { 
+          if(c.geometry) c.geometry.dispose(); 
+          if(c.material) Array.isArray(c.material) ? c.material.forEach((m:any)=>m.dispose()) : c.material.dispose(); 
+        });
         scene.remove(obj);
       }
     });
@@ -184,6 +314,7 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     if (allModels.length > 0) {
       const box = new THREE.Box3();
       allModels.forEach(m => box.expandByObject(m));
+      boundsRef.current = box;
       if (!box.isEmpty()) {
         const center = box.getCenter(new THREE.Vector3());
         controlsRef.current.target.copy(center);
@@ -192,5 +323,28 @@ export const Visualizer: React.FC<Props> = ({ mesh1, mesh2, result, boundary }) 
     }
   }, [mesh1?.grid, mesh2?.grid, result, boundary]);
 
-  return <div ref={mountRef} className="flex-1 w-full h-full relative" />;
+  return (
+    <div ref={mountRef} className="flex-1 w-full h-full relative">
+      <div className="absolute top-6 right-6 flex flex-col gap-2 z-10 scale-90 sm:scale-100">
+        <div className="bg-slate-800/80 backdrop-blur border border-slate-700 rounded-xl p-1 shadow-2xl flex flex-col gap-1 text-slate-300">
+          <button onClick={() => setView('TOP')} className="w-10 h-10 flex items-center justify-center rounded-lg hover:bg-indigo-600 hover:text-white transition-colors text-[10px] font-bold" title="正交顶视图">顶</button>
+          <button onClick={() => setView('FRONT')} className="w-10 h-10 flex items-center justify-center rounded-lg hover:bg-indigo-600 hover:text-white transition-colors text-[10px] font-bold" title="正交前视图">前</button>
+          <button onClick={() => setView('LEFT')} className="w-10 h-10 flex items-center justify-center rounded-lg hover:bg-indigo-600 hover:text-white transition-colors text-[10px] font-bold" title="正交左视图">左</button>
+          <button onClick={() => setView('RIGHT')} className="w-10 h-10 flex items-center justify-center rounded-lg hover:bg-indigo-600 hover:text-white transition-colors text-[10px] font-bold" title="正交右视图">右</button>
+          <div className="h-px bg-slate-700 mx-1 my-1"></div>
+          <button onClick={() => setView('ISO')} className="w-10 h-10 flex items-center justify-center rounded-lg bg-indigo-600/50 hover:bg-indigo-600 hover:text-white transition-colors text-[10px] font-bold" title="透视轴测图">轴</button>
+        </div>
+
+        <div className="bg-slate-800/80 backdrop-blur border border-slate-700 rounded-xl p-1 shadow-2xl">
+          <button 
+            onClick={toggleCameraType} 
+            className={`w-10 h-10 flex flex-col items-center justify-center rounded-lg transition-all ${activeCameraType === 'ORTHOGRAPHIC' ? 'bg-blue-600 text-white' : 'hover:bg-slate-700 text-slate-400'}`}
+          >
+            <span className="text-[10px] font-black">{activeCameraType === 'PERSPECTIVE' ? '透视' : '正交'}</span>
+            <div className={`w-1 h-1 rounded-full mt-0.5 ${activeCameraType === 'ORTHOGRAPHIC' ? 'bg-white' : 'bg-blue-400'}`}></div>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 };
